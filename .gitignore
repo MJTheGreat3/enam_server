@@ -1,0 +1,23 @@
+# Ignore secret files
+backend/python/client_secret.json
+backend/python/token.json
+
+# Bytecode & Python cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+.env/
+venv/
+.venv/
+
+# System files
+.DS_Store
+
+# OS/IDE specific
+*.swp
+.idea/
+.vscode/
+
+# Logs
+*.log

@@ -1,0 +1,12 @@
+flask
+psycopg2-binary
+apscheduler
+python-dotenv
+gunicorn
+selenium
+bs4
+pywin32
+requests
+psutil
+filelock
+pandas
