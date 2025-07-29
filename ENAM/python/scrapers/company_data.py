@@ -1,6 +1,7 @@
 import os
 import time
-import pandas as pd
+import gc
+import psutil
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -9,14 +10,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import concurrent.futures
 from datetime import datetime
-from .common import (
-    log_debug, get_csv_path, append_unique_rows,
-    check_system_resources, load_portfolio_symbols,
-    remove_duplicates_from_csv_with_header, convert_nse_datetime
-)
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-USER_PORTFOLIO_CSV = os.path.abspath(os.path.join(SCRIPT_DIR, "../../user_portfolio.csv"))
+import psycopg2
+from psycopg2.extras import execute_values
+from threading import Lock
 
 INSIDER_HEADERS = [
     "Stock", "Clause", "Name", "Type", "Amount", "Value", "Transaction", "Attachment", "Time"
@@ -26,6 +22,140 @@ ANNOUNCEMENTS_HEADERS = [
     "Stock", "Subject", "Announcement", "Attachment", "Time"
 ]
 
+# === PATH CONFIGURATION ===
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+_db_lock = Lock()
+_db_conn_pool = []
+
+def init_db_pool():
+    global _db_conn_pool
+    with _db_lock:
+        if not _db_conn_pool:
+            for _ in range(5):  # Initial pool size
+                conn = psycopg2.connect(
+                    dbname="enam",
+                    user="postgres",
+                    password="mathew",
+                    host="localhost",
+                    port="5432"
+                )
+                _db_conn_pool.append(conn)
+
+def get_db_connection():
+    global _db_conn_pool
+    with _db_lock:
+        if not _db_conn_pool:
+            init_db_pool()
+        return _db_conn_pool.pop()
+
+def return_db_connection(conn):
+    global _db_conn_pool
+    with _db_lock:
+        _db_conn_pool.append(conn)
+
+def close_all_connections():
+    global _db_conn_pool
+    with _db_lock:
+        for conn in _db_conn_pool:
+            try:
+                conn.close()
+            except:
+                pass
+        _db_conn_pool = []
+
+def log_debug(message):
+    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    print(f"{timestamp} {message}")
+
+def load_portfolio_symbols(only_new=False):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            if only_new:
+                cur.execute("""
+                    SELECT symbol FROM symbols 
+                    WHERE status = TRUE AND last_scraped IS NULL
+                """)
+            else:
+                cur.execute("SELECT symbol FROM symbols WHERE status = TRUE")
+            return [row[0] for row in cur.fetchall()]
+    except Exception as e:
+        print(f"Database error fetching symbols: {str(e)[:200]}")
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def append_unique_rows(table, rows):
+    if not rows:
+        return
+        
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            if table == "announcements":
+                query = """
+                    INSERT INTO announcements 
+                    (stock, subject, announcement, attachment, time)
+                    VALUES %s ON CONFLICT (stock, subject, time) DO NOTHING
+                """
+            elif table == "insider_trading":
+                query = """
+                    INSERT INTO insider_trading 
+                    (stock, clause, name, type, amount, value, transaction, attachment, time)
+                    VALUES %s ON CONFLICT (stock, name, transaction, time) DO NOTHING
+                """
+            else:
+                raise ValueError(f"Unknown table: {table}")
+            
+            # Convert empty strings to None for PostgreSQL
+            processed_rows = []
+            for row in rows:
+                processed_row = [
+                    None if isinstance(x, str) and not x.strip() else x 
+                    for x in row
+                ]
+                processed_rows.append(processed_row)
+            
+            execute_values(cur, query, processed_rows)
+            conn.commit()
+    except Exception as e:
+        print(f"Database error inserting into {table}: {str(e)[:200]}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def check_system_resources():
+    cpu_threshold = 80
+    mem_threshold = 85
+    wait_time = 5
+    max_attempts = 5
+
+    attempt = 0
+    while attempt < max_attempts:
+        cpu_usage = psutil.cpu_percent(interval=1)
+        mem_usage = psutil.virtual_memory().percent
+        if cpu_usage < cpu_threshold and mem_usage < mem_threshold:
+            return
+        print(f"[WARN] High usage - CPU: {cpu_usage}%, Mem: {mem_usage}% - GC Attempt {attempt+1}")
+        gc.collect()
+        attempt += 1
+        time.sleep(wait_time)
+    raise Exception("Resources too constrained after attempts.")
+
+def convert_nse_datetime(raw):
+    try:
+        dt = datetime.strptime(raw.strip(), "%d-%b-%Y %H:%M:%S")
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except:
+        return raw
+
+# === WebDriver ===
 def create_driver():
     options = Options()
     options.add_argument("--no-first-run")
@@ -38,18 +168,27 @@ def create_driver():
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--no-sandbox")
-    options.add_argument("--headless=new")
     options.add_experimental_option("excludeSwitches", ["enable-logging"])
     driver = webdriver.Chrome(options=options)
     driver.set_page_load_timeout(30)
     return driver
 
+def log_error(company, error, driver=None):
+    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    print(f"{timestamp} ERROR - {company}: {error}")
+    
+    if driver:
+        print(f"{timestamp} HTML Snapshot for {company}:\n{'='*40}")
+        print(driver.page_source)
+        print(f"{'='*40}\n")
+
+# === Scraper ===
 def scrape_company_data(company):
     for attempt in range(3):
         driver = None
         try:
             print(f"Starting scrape for: {company}")
-            check_system_resources()
+            # check_system_resources()
             driver = create_driver()
             driver.get(f"https://www.nseindia.com/get-quotes/equity?symbol={company}")
             wait = WebDriverWait(driver, 20)
@@ -102,7 +241,7 @@ def scrape_company_data(company):
                         anns.append(ann)
 
                     if anns:
-                        append_unique_rows("announcements.csv", anns, header=ANNOUNCEMENTS_HEADERS)
+                        append_unique_rows("announcements", anns)
                         print(f"[{company}] Announcements extracted: {len(anns)} records")
                     else:
                         print(f"[{company}] No announcements found")
@@ -142,7 +281,7 @@ def scrape_company_data(company):
                         its.append(it)
 
                     if its:
-                        append_unique_rows("insider_trading.csv", its, header=INSIDER_HEADERS)
+                        append_unique_rows("insider_trading", its)
                         print(f"[{company}] Insider Trading extracted: {len(its)} records")
                     else:
                         print(f"[{company}] No insider trading data found")
@@ -158,33 +297,29 @@ def scrape_company_data(company):
             if driver:
                 driver.quit()
 
+# === Runner ===
 def run_company_scrapers(only_new=False):
+    # Initialize connection pool on import
+    init_db_pool()
+
     start_time = time.time()
-    companies = load_portfolio_symbols(only_new=only_new)
+    companies = load_portfolio_symbols(only_new)
     if not companies:
-        print("[WARN] No companies in portfolio, skipping company scraping")
+        print("[WARN] No active companies found in symbols table")
         return
 
-    tasks = [lambda c=c: scrape_company_data(c) for c in companies]
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(task) for task in tasks]
+    # Limit workers based on system resources
+    cpu_count = os.cpu_count() or 1
+    max_workers = min(1, cpu_count, len(companies))
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(scrape_company_data, c): c for c in companies}
         for future in concurrent.futures.as_completed(futures):
+            company = futures[future]
             try:
                 future.result()
-            except:
-                pass
+            except Exception as e:
+                print(f"[ERROR] Thread failed for {company}: {str(e)[:100]}")
 
-    for filename in ["announcements.csv", "insider_trading.csv"]:
-        full_path = get_csv_path(filename)
-        if os.path.exists(full_path):
-            remove_duplicates_from_csv_with_header(full_path)
-
-    if only_new:
-        if os.path.exists(USER_PORTFOLIO_CSV):
-            df = pd.read_csv(USER_PORTFOLIO_CSV)
-            if 'status' in df.columns:
-                df.loc[df['status'].str.upper() == "NEW", 'status'] = "Old"
-                df.to_csv(USER_PORTFOLIO_CSV, index=False)
-
-    print(f"Company scraping completed in {time.time()-start_time:.2f} seconds")
+    print(f"Company scraping completed in {time.time() - start_time:.2f} seconds")
+    close_all_connections()

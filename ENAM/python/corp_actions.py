@@ -1,21 +1,52 @@
 import requests
 import pandas as pd
 import os
+import psycopg2
+import logging
 from datetime import datetime, timedelta
 
-# === PATH SETUP ===
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ASSETS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "../../frontend/static/assets/csv"))
-MAIN_CSV = os.path.join(ASSETS_DIR, "corp_actions.csv")
-TEMP_CSV = os.path.join(ASSETS_DIR, "downloaded.csv")
+# === LOGGING CONFIGURATION ===
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# === FUNCTIONS ===
+# === DB CONFIG ===
+DB_CONFIG = {
+    "dbname": "enam",
+    "user": "postgres",
+    "password": "mathew",
+    "host": "localhost",
+    "port": 5432
+}
 
+# === DB UTILS ===
+def get_connection():
+    logging.debug("Connecting to database...")
+    return psycopg2.connect(**DB_CONFIG)
+
+def truncate_table(table):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            logging.debug(f"Truncating table: {table}")
+            cur.execute(f"TRUNCATE {table}")
+        conn.commit()
+
+def batch_insert_corp_actions(rows):
+    logging.debug(f"Inserting {len(rows)} rows into corp_actions...")
+    query = """
+        INSERT INTO corp_actions (
+            Security_Code, Security_Name, Company_Name, Ex_Date, Purpose,
+            Record_Date, BC_Start_Date, BC_End_Date, ND_Start_Date, ND_End_Date, Actual_Payment_Date
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(query, rows)
+        conn.commit()
+    logging.info("Data inserted into corp_actions successfully.")
+
+# === DOWNLOAD CSV ===
 def download_bse_csv(temp_file):
-    """Download CSV exactly like BSE site does"""
     url = "https://api.bseindia.com/BseIndiaAPI/api/CorpactCSVDownload/w"
-
-    # Mimic site: empty Fdate/TDate = full data
     params = {
         "scripcode": "",
         "Fdate": "",
@@ -26,7 +57,6 @@ def download_bse_csv(temp_file):
         "ddlcategorys": "E",
         "segment": "0"
     }
-
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -36,34 +66,20 @@ def download_bse_csv(temp_file):
         "Referer": "https://www.bseindia.com/"
     }
 
-    print("[DEBUG] Sending request to BSE...")
+    logging.info("Requesting CSV from BSE...")
     response = requests.get(url, headers=headers, params=params)
     if response.ok:
         with open(temp_file, "wb") as f:
             f.write(response.content)
-        print(f"[DEBUG] Downloaded BSE CSV to {temp_file}")
+        logging.info(f"Downloaded BSE CSV to {temp_file}")
     else:
-        raise Exception(f"[ERROR] Failed to download: {response.status_code}")
+        logging.error(f"Failed to download. Status: {response.status_code}")
+        raise Exception(f"Failed to download BSE CSV")
 
-def ensure_main_csv_exists(header):
-    """If main CSV does not exist, create it with header"""
-    if not os.path.exists(MAIN_CSV):
-        print("[DEBUG] Main CSV not found. Creating new with header.")
-        empty_df = pd.DataFrame(columns=header)
-        empty_df.to_csv(MAIN_CSV, index=False)
-    else:
-        print("[DEBUG] Main CSV already exists.")
-
-def load_csv(file):
-    """Load a CSV into DataFrame"""
-    print(f"[DEBUG] Loading CSV: {file}")
-    df = pd.read_csv(file)
-    print(f"[DEBUG] Loaded {len(df)} rows.")
-    return df
-
+# === DATE PARSING ===
 def parse_date_safe(date_str):
     """
-    Parse BSE date format like '27 Jun 2025'.
+    Parse BSE date format like '15 Jul 2025'.
     Return None if missing or invalid.
     """
     if not isinstance(date_str, str):
@@ -72,15 +88,14 @@ def parse_date_safe(date_str):
     if not date_str:
         return None
     try:
-        return datetime.strptime(date_str, "%d %b %Y")
+        parsed = datetime.strptime(date_str, "%d %b %Y").date()
+        return parsed
     except ValueError:
         return None
 
+# === FILTER BY DATE WINDOW ===
 def filter_by_date_window(df):
-    """
-    Keep only records with Record Date or Ex Date in next 2 months (inclusive).
-    """
-    print("[DEBUG] Filtering by date window...")
+    logging.debug("Filtering by 2-month window on Record Date / Ex Date...")
     today = datetime.today().date()
     two_months = today + timedelta(days=61)
 
@@ -90,58 +105,95 @@ def filter_by_date_window(df):
     def is_in_range(date_val):
         if date_val is None:
             return False
-        d = date_val.date()
-        return today <= d <= two_months
+        return today <= date_val <= two_months
 
-    keep_mask = record_dates.apply(is_in_range) | ex_dates.apply(is_in_range)
-    filtered = df[keep_mask]
-    print(f"[DEBUG] Rows after filtering: {len(filtered)}")
+    mask = record_dates.apply(is_in_range) | ex_dates.apply(is_in_range)
+    filtered = df[mask]
+    logging.debug(f"Rows after filtering: {len(filtered)}")
     return filtered
 
+# === MAIN ===
 def main():
-    print("[INFO] Starting corporate actions update process...")
+    logging.info("Starting Corporate Actions pipeline...")
 
-    # Step 1: Download BSE CSV to temp
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    TEMP_CSV = os.path.join(SCRIPT_DIR, "downloaded_bse.csv")
+
+    # 1. Download
     download_bse_csv(TEMP_CSV)
 
-    # Step 2: Load the downloaded CSV
-    downloaded_df = load_csv(TEMP_CSV)
+    # 2. Load
+    logging.debug("Loading downloaded CSV...")
+    df = pd.read_csv(TEMP_CSV)
+    logging.debug(f"Loaded {len(df)} rows from downloaded CSV.")
 
-    if downloaded_df.empty:
-        print("[WARN] Downloaded CSV is empty. Nothing to do.")
+    # 3. CLEAN HEADERS
+    df.columns = df.columns.str.strip()
+    logging.debug(f"Cleaned columns: {list(df.columns)}")
+
+    if df.empty:
+        logging.warning("Downloaded CSV is empty. Exiting.")
         os.remove(TEMP_CSV)
         return
 
-    # Step 3: Ensure main CSV exists
-    ensure_main_csv_exists(header=downloaded_df.columns)
+    # 4. Drop duplicates early
+    df = df.drop_duplicates()
+    logging.debug(f"Rows after initial deduplication: {len(df)}")
 
-    # Step 4: Load existing corpus
-    main_df = load_csv(MAIN_CSV)
+    # 5. Filter for date window
+    df = filter_by_date_window(df)
 
-    # Step 5: Concatenate and drop duplicates
-    combined_df = pd.concat([main_df, downloaded_df])
-    combined_df = combined_df.drop_duplicates()
-    print(f"[DEBUG] Combined unique rows: {len(combined_df)}")
+    if df.empty:
+        logging.warning("No rows within 2-month window. Exiting.")
+        os.remove(TEMP_CSV)
+        return
 
-    # Step 6: Filter for date window
-    filtered_df = filter_by_date_window(combined_df)
-
-    # Step 7: Keep only desired columns
+    # 6. Keep only desired columns
     desired_cols = [
         "Security Code","Security Name","Company Name","Ex Date","Purpose",
         "Record Date","BC Start Date","BC End Date","ND Start Date","ND End Date","Actual Payment Date"
     ]
-    filtered_df = filtered_df[desired_cols]
+    df = df[desired_cols]
 
-    # Step 8: Write back to MAIN CSV
-    filtered_df.to_csv(MAIN_CSV, index=False)
-    print(f"[INFO] Saved updated corpus to {MAIN_CSV}")
+    # 7. Convert date columns to DATE
+    date_cols = [
+        "Ex Date", "Record Date", "BC Start Date", "BC End Date",
+        "ND Start Date", "ND End Date", "Actual Payment Date"
+    ]
+    for col in date_cols:
+        df[col] = df[col].apply(parse_date_safe)
 
-    # Step 9: Delete temp file
+    # 8. Final deduplication (after date parsing)
+    df = df.drop_duplicates()
+    logging.debug(f"Rows after final deduplication: {len(df)}")
+
+    # 9. Prepare rows for DB
+    rows = [
+        (
+            row["Security Code"], row["Security Name"], row["Company Name"],
+            row["Ex Date"], row["Purpose"], row["Record Date"],
+            row["BC Start Date"], row["BC End Date"],
+            row["ND Start Date"], row["ND End Date"],
+            row["Actual Payment Date"]
+        )
+        for _, row in df.iterrows()
+    ]
+
+    if not rows:
+        logging.warning("No valid rows to insert. Exiting.")
+        os.remove(TEMP_CSV)
+        return
+
+    # 10. Upload to DB
+    truncate_table("corp_actions")
+    batch_insert_corp_actions(rows)
+
+    # 11. Cleanup
     os.remove(TEMP_CSV)
-    print(f"[INFO] Deleted temp file {TEMP_CSV}")
+    logging.info(f"Deleted temp file {TEMP_CSV}")
 
-    print("[INFO] Corporate actions update complete.")
+    logging.info("Corporate Actions pipeline completed successfully.")
 
+# === ENTRY POINT ===
 if __name__ == "__main__":
     main()

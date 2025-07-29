@@ -6,7 +6,6 @@
   flex-direction: column;
   overflow: hidden;
   font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
-  background-color: #f6f8fa;
 }
 
 .main-content-wrapper {
@@ -23,7 +22,7 @@
   min-width: 280px;
   background: white;
   border-radius: 10px;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
   display: flex;
   flex-direction: column;
   max-height: 100%;
@@ -89,7 +88,7 @@
   padding: 10px 20px;
   background: white;
   border-radius: 12px;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
   margin-bottom: 15px;
   flex-shrink: 0;
   z-index: 3;
@@ -168,7 +167,7 @@
 }
 
 .choices__button {
-  background: url('/static/assets/img/close.svg') center center no-repeat;
+  background: url("/static/assets/img/close.svg") center center no-repeat;
   background-size: 12px 12px;
   width: 16px;
   height: 16px;
@@ -229,7 +228,7 @@
   flex-direction: column;
   background: white;
   border-radius: 8px;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
   overflow: hidden;
   border: 1px solid #dee2e6;
 }
@@ -269,9 +268,52 @@
   background-color: #f9f9fb;
 }
 
-.table tbody tr:hover td {
-  background-color: #f1f3f5;
-  transition: background-color 0.2s;
+/* Center align Buy/Sell values */
+.table td.text-center {
+  vertical-align: middle;
+  text-align: center;
+}
+
+/* Highlight for Buy cells with value */
+.buy-cell {
+  background-color: #d4edda !important; /* Light green */
+}
+
+/* Highlight for Sell cells with value */
+.sell-cell {
+  background-color: #f8d7da !important; /* Light red */
+}
+
+/* Darker font color for all data cells */
+.table-dark-text {
+  color: #343a40; /* Bootstrap’s text-dark */
+}
+
+/* Remove global hover override */
+.table-hover tbody tr:hover {
+  background-color: transparent !important;
+  color: inherit !important;
+  cursor: default !important;
+}
+
+/* Highlight all cells on hover */
+tr.hover-green:hover td {
+  background-color: #c3e6cb !important;
+  color: #1e4620 !important;
+  cursor: default;
+}
+
+tr.hover-red:hover td {
+  background-color: #f5c6cb !important;
+  color: #721c24 !important;
+  cursor: default;
+}
+
+/* Remove hover effect *only* from the rowspan stock cell */
+td.rowspan-stock:hover {
+  background-color: transparent !important;
+  color: #343a40 !important; /* match .table-dark-text */
+  cursor: default;
 }
 
 /* Responsive */

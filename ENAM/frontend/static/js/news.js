@@ -14,26 +14,23 @@ document.addEventListener('DOMContentLoaded', () => {
   let currentPage = 1;
   let pageSize = parseInt(pageSizeSelect.value);
 
-  Papa.parse('../static/assets/csv/news_repository.csv', {
-    header: true,
-    download: true,
-    skipEmptyLines: true,
-    complete: (results) => {
-      allData = results.data
-        .filter(r => r.Time && r.Headline)
-        .sort((a, b) => new Date(b.Time) - new Date(a.Time));
+  fetch('/api/news')
+    .then(response => response.json())
+    .then(data => {
+      allData = data
+        .filter(r => r.time && r.headline)
+        .sort((a, b) => new Date(b.time) - new Date(a.time));
       populateFilters();
       applyFilters();
-    }
-  });
+    });
 
   function populateFilters() {
     const sources = new Set();
     const categories = new Set();
 
     allData.forEach(item => {
-      if (item.Source) sources.add(item.Source.trim());
-      if (item.Category) categories.add(item.Category.trim());
+      if (item.source) sources.add(item.source.trim());
+      if (item.category) categories.add(item.category.trim());
     });
 
     [...sources].sort().forEach(src => {
@@ -73,7 +70,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const now = new Date();
 
     pageData.forEach(item => {
-      const time = new Date(item.Time);
+      const time = new Date(item.time);
       const diffMs = now - time;
       const diffMins = Math.floor(diffMs / 60000);
       const diffHrs = Math.floor(diffMins / 60);
@@ -85,8 +82,8 @@ document.addEventListener('DOMContentLoaded', () => {
       else if (diffHrs < 24) relativeTime = `${diffHrs} hour${diffHrs === 1 ? '' : 's'} ago`;
       else relativeTime = `${diffDays} day${diffDays === 1 ? '' : 's'} ago`;
 
-      const categories = item.Category
-        ? item.Category.split(',').map(cat => cat.trim()).filter(Boolean)
+      const categories = item.category
+        ? item.category.split(',').map(cat => cat.trim()).filter(Boolean)
         : [];
 
       const badgesHTML = categories.map(cat => {
@@ -101,9 +98,9 @@ document.addEventListener('DOMContentLoaded', () => {
             <div>
               <div>${badgesHTML}</div>
               <div class="fs-5 fw-semibold mb-1">
-                <a href="${item.Link}" target="_blank" class="text-decoration-none">${item.Headline}</a>
+                <a href="${item.link}" target="_blank" class="text-decoration-none">${item.headline}</a>
               </div>
-              <div class="text-muted small">Source: ${item.Source}</div>
+              <div class="text-muted small">Source: ${item.source}</div>
             </div>
             <div class="text-muted small text-end">${relativeTime}</div>
           </div>
@@ -148,7 +145,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const pageButtons = [];
     if (totalPages <= 7) {
-      // Show all pages if few enough
       for (let i = 1; i <= totalPages; i++) {
         pageButtons.push(renderPageButton(i));
       }
@@ -199,9 +195,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const search = searchInput.value.toLowerCase();
 
     filteredData = allData.filter(item => {
-      const srcMatch = !src || item.Source.toLowerCase() === src;
-      const catMatch = !cat || item.Category.toLowerCase() === cat;
-      const searchMatch = !search || item.Headline.toLowerCase().includes(search);
+      const srcMatch = !src || item.source.toLowerCase() === src;
+      const catMatch = !cat || item.category.toLowerCase() === cat;
+      const searchMatch = !search || item.headline.toLowerCase().includes(search);
       return srcMatch && catMatch && searchMatch;
     });
 

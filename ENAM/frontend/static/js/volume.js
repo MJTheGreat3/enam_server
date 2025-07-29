@@ -1,52 +1,35 @@
 document.addEventListener('DOMContentLoaded', async () => {
-  await loadUserPortfolio();
-  if (state.portfolioSymbols && state.portfolioSymbols.size) {
-    setupFilterAndLoad('../static/assets/csv/trd_deviation.csv', 'trd', 'AVG_TTL_TRD_QNTY', 'NEW_TTL_TRD_QNTY');
-    setupFilterAndLoad('../static/assets/csv/deliv_deviation.csv', 'deliv', 'AVG_DELIV_QTY', 'NEW_DELIV_QTY');
-  } else {
-    console.error("[ERROR] No portfolio symbols loaded. Cannot display deviations.");
-  }
+  await loadDeviationData('/api/volume', 'trd', 'avg_ttl_trd_qnty', 'new_ttl_trd_qnty');
+  await loadDeviationData('/api/delivery', 'deliv', 'avg_deliv_qty', 'new_deliv_qty');
 });
 
 const state = {};
 
-// === Fetch user portfolio from /api/portfolio ===
-async function loadUserPortfolio() {
-  console.log("[INFO] Fetching user portfolio from /api/portfolio ...");
+async function loadDeviationData(apiUrl, section, avgField, newField) {
   try {
-    const res = await fetch("/api/portfolio");
+    const res = await fetch(apiUrl);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
 
-    const portfolio = await res.json();
-    const symbols = portfolio
-      .map(item => item.symbol && item.symbol.trim().toLowerCase())
-      .filter(Boolean);
-
-    state.portfolioSymbols = new Set(symbols);
-    console.log("[INFO] Loaded user portfolio symbols:", Array.from(state.portfolioSymbols));
-  } catch (err) {
-    console.error("[ERROR] Failed to fetch user portfolio:", err);
-    state.portfolioSymbols = new Set();
-  }
-}
-
-// === Load and filter deviation data ===
-function setupFilterAndLoad(csvFile, section, avgField, newField) {
-  Papa.parse(csvFile, {
-    header: true,
-    download: true,
-    complete: results => {
-      const data = results.data.filter(row => {
-        const sym = row.SYMBOL?.trim().toLowerCase();
-        return sym && row[avgField] && state.portfolioSymbols.has(sym);
-      });
-
-      state[section] = { data, avgField, newField, filter: [] };
-
-      initFilter(section, data);
-      renderAll(section);
+    if (!Array.isArray(data) || data.length === 0) {
+      console.warn(`[WARN] No data received for ${section}`);
+      return;
     }
-  });
+
+    // Normalize keys and store state
+    const formattedData = data.map(row => ({
+      SYMBOL: row.symbol?.trim(),
+      [avgField]: row[avgField],
+      [newField]: row[newField],
+      PCT_DEVIATION: row.pct_deviation
+    })).filter(row => row.SYMBOL && row[avgField] && row[newField]);
+
+    state[section] = { data: formattedData, avgField, newField, filter: [] };
+    initFilter(section, formattedData);
+    renderAll(section);
+  } catch (err) {
+    console.error(`[ERROR] Failed to load ${section} deviation:`, err);
+  }
 }
 
 function initFilter(section, data) {

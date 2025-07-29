@@ -1,23 +1,20 @@
-import csv
-import os
+import psycopg2
+from psycopg2.extras import DictCursor
 from dateutil import parser
 from datetime import datetime, timedelta
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_FILE = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "frontend", "static", "assets", "csv", "news_repository.csv"))
+# === DATABASE CONFIG ===
+DB_NAME = "enam"
+DB_USER = "postgres"
+DB_PASSWORD = "mathew"
+DB_HOST = "localhost"
+DB_PORT = 5432
 
+# === Category Logic ===
 ALLOWED_CATEGORIES_PRIORITY = [
-    'Stock',
-    'IPOs',
-    'Companies',
-    'Markets',
-    'Economy',
-    'Finance',
-    'Business',
-    'Industry',
-    'Technology',
-    'Research',
-    'Other'
+    'Stock', 'IPOs', 'Companies', 'Markets', 'Economy',
+    'Finance', 'Business', 'Industry', 'Technology',
+    'Research', 'Other'
 ]
 
 SPECIAL_WORD_MAPPING = {
@@ -27,129 +24,116 @@ SPECIAL_WORD_MAPPING = {
     'equity': 'Markets',
     'commodities': 'Industry',
     'commodity': 'Industry',
-    'asset': 'Business'
+    'asset': 'Business',
+    'earnings': 'Business'
 }
 
 def clean_time_string(time_str):
-    """
-    Convert '14:57 | Jun 30, 2025' or other mixed formats to 'YYYY-MM-DD HH:MM:SS'
-    """
+    if not time_str:
+        return None
     time_str = time_str.strip()
-    if "|" in time_str:
-        try:
+    try:
+        if "|" in time_str:
             time_part, date_part = [s.strip() for s in time_str.split("|", 1)]
             combined = f"{date_part} {time_part}"
             dt = parser.parse(combined)
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception as e:
-            print(f"[Warning] Could not parse split time '{time_str}': {e}")
-            return time_str
-    else:
-        try:
+        else:
             dt = parser.parse(time_str)
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception as e:
-            print(f"[Warning] Could not parse time '{time_str}': {e}")
-            return time_str
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception as e:
+        print(f"[Warning] Could not parse time '{time_str}': {e}")
+        return None
 
 def normalize_category_word(word):
-    """
-    Normalize plural to singular basic forms for matching.
-    E.g. 'stocks' -> 'stock'
-    """
     word = word.lower().strip()
     if word.endswith('s') and not word.endswith('ss'):
         return word[:-1]
     return word
 
 def map_single_category(raw_cat):
-    """
-    Maps a single category string to one of the allowed categories using the specified rules.
-    """
     raw_cat_clean = raw_cat.strip()
     if not raw_cat_clean:
         return "Other"
 
     cat_lower = raw_cat_clean.lower()
 
-    # 1. Check special words mapping
     for special_word, mapped in SPECIAL_WORD_MAPPING.items():
         if special_word in cat_lower:
             return mapped
 
-    # 2. Exact match (singular/plural) against allowed categories
     normalized_input = normalize_category_word(cat_lower)
     for allowed in ALLOWED_CATEGORIES_PRIORITY:
         if normalize_category_word(allowed.lower()) == normalized_input:
             return allowed
 
-    # 3. Substring / partial match in priority order
     for allowed in ALLOWED_CATEGORIES_PRIORITY:
-        allowed_lower = allowed.lower()
-        if allowed_lower in cat_lower:
+        if allowed.lower() in cat_lower:
             return allowed
 
-    # 4. If no match at all
     return "Other"
 
 def clean_category_string(category_str):
-    """
-    Splits multiple categories, normalizes each according to mapping and rules,
-    rejoins them in a comma-separated string.
-    """
     if not category_str:
         return "Other"
-
     categories = [c.strip() for c in category_str.split(',') if c.strip()]
     cleaned = [map_single_category(cat) for cat in categories]
 
-    # Deduplicate while preserving order
     seen = set()
     result = []
     for cat in cleaned:
         if cat not in seen:
             seen.add(cat)
             result.append(cat)
-
     return ', '.join(result)
 
 def is_recent_enough(time_str, days=14):
-    """
-    Returns True if the parsed datetime is within the last 'days' days.
-    """
     try:
         dt = parser.parse(time_str)
         cutoff = datetime.now() - timedelta(days=days)
         return dt >= cutoff
     except Exception as e:
         print(f"[Warning] Could not parse time for filtering '{time_str}': {e}")
-        return False  # If can't parse, exclude it
+        return False
 
-def clean_csv_in_place(csv_file):
-    cleaned_rows = []
+def clean_news_table():
+    conn = psycopg2.connect(
+        dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD,
+        host=DB_HOST, port=DB_PORT
+    )
+    cursor = conn.cursor(cursor_factory=DictCursor)
 
-    with open(csv_file, newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        fieldnames = reader.fieldnames
-        for row in reader:
-            if 'Time' in row:
-                row['Time'] = clean_time_string(row['Time'])
-            if 'Category' in row:
-                row['Category'] = clean_category_string(row['Category'])
+    cursor.execute("SELECT id, time, category FROM news")
+    rows = cursor.fetchall()
 
-            # Filter out rows older than 2 weeks
-            if 'Time' in row and is_recent_enough(row['Time']):
-                cleaned_rows.append(row)
-            else:
-                if 'Time' in row:
-                    print(f"[INFO] Removing old article dated {row['Time']}")
+    cleaned_count = 0
+    deleted_count = 0
 
-    with open(csv_file, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(cleaned_rows)
+    for row in rows:
+        row_id = row['id']
+        raw_time = row['time']
+        raw_cat = row['category']
 
-    print(f"Cleaning complete. File '{csv_file}' updated in place.")
+        cleaned_time = clean_time_string(raw_time)
+        if not cleaned_time or not is_recent_enough(cleaned_time):
+            print(f"[INFO] Deleting old or invalid article: {raw_time}")
+            cursor.execute("DELETE FROM news WHERE id = %s", (row_id,))
+            deleted_count += 1
+            continue
+
+        cleaned_category = clean_category_string(raw_cat)
+
+        if cleaned_time != raw_time or cleaned_category != raw_cat:
+            cursor.execute(
+                "UPDATE news SET time = %s, category = %s WHERE id = %s",
+                (cleaned_time, cleaned_category, row_id)
+            )
+            cleaned_count += 1
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    print(f"[DONE] Cleaned: {cleaned_count} rows | Deleted: {deleted_count} rows")
 
 if __name__ == "__main__":
-    clean_csv_in_place(CSV_FILE)
+    clean_news_table()

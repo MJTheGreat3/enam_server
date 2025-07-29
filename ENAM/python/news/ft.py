@@ -3,20 +3,13 @@ from selenium.webdriver.chrome.options import Options
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import time
-import pandas as pd
+import psycopg2
+from psycopg2.extras import execute_values
 import os
-from filelock import FileLock
 
 # ------------------ CONFIG ------------------
 BASE_URL = "https://www.ft.com/news-feed"
-
-# Compute absolute path to CSV file
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_FILE = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "..", "frontend", "static", "assets", "csv", "news_repository.csv"))
-LOCK_FILE = CSV_FILE + ".lock"
-
 SOURCE_NAME = "Financial Times"
-COLUMNS = ["Source", "Headline", "Link", "Category", "Time"]
 
 ALLOWED_CATEGORIES = [
     "Markets", "Banking", "Asset", "Business", "Stock",
@@ -25,25 +18,22 @@ ALLOWED_CATEGORIES = [
 
 CUTOFF_TIME = datetime.now() - timedelta(hours=24)
 
+# ------------------ DB CONNECTION ------------------
+def get_connection():
+    return psycopg2.connect(
+        dbname="enam",
+        user="postgres",
+        password="mathew",
+        host="localhost",
+        port="5432"
+    )
+
 # ------------------ SETUP CHROME ------------------
 options = Options()
 options.add_argument('--headless')
 options.add_argument('--disable-gpu')
 options.add_argument('--no-sandbox')
 driver = webdriver.Chrome(options=options)
-
-# ------------------ LOAD EXISTING ------------------
-with FileLock(LOCK_FILE):
-    if os.path.exists(CSV_FILE):
-        existing_df = pd.read_csv(CSV_FILE)
-        if not all(col in existing_df.columns for col in COLUMNS):
-            existing_df = pd.DataFrame(columns=COLUMNS)
-        existing_urls = set(existing_df["Link"].dropna().tolist())
-        existing_titles = set(existing_df["Headline"].dropna().tolist())
-    else:
-        existing_df = pd.DataFrame(columns=COLUMNS)
-        existing_urls = set()
-        existing_titles = set()
 
 # ------------------ HELPERS ------------------
 def is_relevant_category(category_text):
@@ -55,7 +45,28 @@ def parse_article_date(date_text):
     except Exception:
         return None
 
-def parse_page_articles(page_source):
+def get_existing_links_and_headlines():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT link, headline FROM news WHERE source = %s", (SOURCE_NAME,))
+            rows = cur.fetchall()
+            existing_urls = {r[0] for r in rows}
+            existing_titles = {r[1] for r in rows}
+    return existing_urls, existing_titles
+
+def insert_articles(articles):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            values = [(SOURCE_NAME, a["Headline"], a["Link"], a["Category"], a["Time"]) for a in articles]
+            query = """
+                INSERT INTO news (source, headline, link, category, time)
+                VALUES %s
+                ON CONFLICT (link) DO NOTHING;
+            """
+            execute_values(cur, query, values)
+        conn.commit()
+
+def parse_page_articles(page_source, existing_urls, existing_titles):
     soup = BeautifulSoup(page_source, 'html.parser')
     items = soup.find_all("li", class_="o-teaser-collection__item")
     articles = []
@@ -97,7 +108,6 @@ def parse_page_articles(page_source):
 
         # --- Add article ---
         articles.append({
-            "Source": SOURCE_NAME,
             "Headline": headline,
             "Link": url,
             "Category": category,
@@ -107,6 +117,8 @@ def parse_page_articles(page_source):
     return articles, stop_scraping
 
 # ------------------ MAIN SCRAPER ------------------
+existing_urls, existing_titles = get_existing_links_and_headlines()
+
 all_articles = []
 page = 1
 while True:
@@ -115,7 +127,7 @@ while True:
     driver.get(url)
     time.sleep(5)
 
-    new_articles, stop = parse_page_articles(driver.page_source)
+    new_articles, stop = parse_page_articles(driver.page_source, existing_urls, existing_titles)
     print(f"Found {len(new_articles)} new articles on page {page}")
 
     all_articles.extend(new_articles)
@@ -128,20 +140,9 @@ while True:
 
 driver.quit()
 
-# ------------------ SAVE RESULTS ------------------
+# ------------------ SAVE TO DB ------------------
 if all_articles:
-    new_df = pd.DataFrame(all_articles, columns=COLUMNS)
-    with FileLock(LOCK_FILE):
-        if os.path.exists(CSV_FILE):
-            existing_df = pd.read_csv(CSV_FILE)
-            if not all(col in existing_df.columns for col in COLUMNS):
-                existing_df = pd.DataFrame(columns=COLUMNS)
-            combined_df = pd.concat([new_df, existing_df], ignore_index=True)
-        else:
-            combined_df = new_df
-
-        combined_df.to_csv(CSV_FILE, index=False)
-
-    print(f"{len(all_articles)} articles added from Financial Times.")
+    insert_articles(all_articles)
+    print(f"{len(all_articles)} articles added to DB from Financial Times.")
 else:
     print("No new articles found to add.")

@@ -1,7 +1,8 @@
-import os
 import time
 import re
+import gc
 import requests
+import psutil
 import traceback
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
@@ -10,9 +11,78 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import WebDriverException, TimeoutException
 import concurrent.futures
-from .common import log_debug, get_csv_path, append_unique_rows, check_system_resources, remove_duplicates_from_csv_with_header
+import psycopg2
+from psycopg2.extras import execute_values
+
+def get_db_connection():
+    return psycopg2.connect(
+        dbname="enam",
+        user="postgres",
+        password="mathew",
+        host="localhost",
+        port="5432"
+    )
+
+def log_debug(message):
+    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    print(f"{timestamp} {message}")
+
+def check_system_resources():
+    cpu_threshold = 80
+    mem_threshold = 85
+    wait_time = 5
+    max_attempts = 5
+
+    attempt = 0
+    while attempt < max_attempts:
+        cpu_usage = psutil.cpu_percent(interval=1)
+        mem_usage = psutil.virtual_memory().percent
+        if cpu_usage < cpu_threshold and mem_usage < mem_threshold:
+            return
+        print(f"[WARN] High usage - CPU: {cpu_usage}%, Mem: {mem_usage}% - GC Attempt {attempt+1}")
+        gc.collect()
+        attempt += 1
+        time.sleep(wait_time)
+    raise Exception("Resources too constrained after attempts.")
+    
+def append_unique_rows(table, rows):
+    if not rows:
+        return
+        
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            if table == "bulk_deals":
+                query = """
+                    INSERT INTO bulk_deals
+                    (source, deal_date, security_name, client_name, deal_type, quantity, price)
+                    VALUES %s ON CONFLICT (source, deal_date, security_name, client_name, deal_type, quantity, price) DO NOTHING
+                """
+            elif table == "block_deals":
+                query = """
+                    INSERT INTO block_deals
+                    (source, deal_date, security_name, client_name, deal_type, quantity, trade_price)
+                    VALUES %s ON CONFLICT (source, deal_date, security_name, client_name, deal_type, quantity, trade_price) DO NOTHING
+                """
+            else:
+                raise ValueError(f"Unknown table: {table}")
+            
+            processed_rows = []
+            for row in rows:
+                processed_row = [
+                    None if isinstance(x, str) and not x.strip() else x 
+                    for x in row
+                ]
+                processed_rows.append(processed_row)
+            
+            execute_values(cur, query, processed_rows)
+            conn.commit()
+    except Exception as e:
+        print(f"Database error inserting into {table}: {str(e)[:200]}")
+        if conn:
+            conn.rollback()
 
 def create_driver():
     options = Options()
@@ -34,7 +104,7 @@ def create_driver():
 def scrape_bse_bulk():
     for attempt in range(3):
         try:
-            check_system_resources()
+            # check_system_resources()
             driver = create_driver()
             bulk_url = "https://www.bseindia.com/markets/equity/EQReports/bulk_deals.aspx"
             driver.get(bulk_url)
@@ -55,7 +125,7 @@ def scrape_bse_bulk():
                     elif cells[4] == "S":
                         cells[4] = "SELL"
                     bulks.append(["BSE"] + [cells[0]] + cells[2:])
-            append_unique_rows("bulk_deals.csv", bulks)
+            append_unique_rows("bulk_deals", bulks)
             print(f"BSE Bulk Deals extracted ({date_string})")
             return
         except Exception as e:
@@ -70,7 +140,7 @@ def scrape_bse_bulk():
 def scrape_bse_block():
     for attempt in range(3):
         try:
-            check_system_resources()
+            # check_system_resources()
             driver = create_driver()
             block_bse_url = "https://www.bseindia.com/markets/equity/EQReports/block_deals.aspx"
             driver.get(block_bse_url)
@@ -91,7 +161,7 @@ def scrape_bse_block():
                     elif cells[4] == "S":
                         cells[4] = "Sell"
                     bse_blocks.append(["BSE"] + [cells[0]] + cells[2:])
-            append_unique_rows("block_deals.csv", bse_blocks)
+            append_unique_rows("block_deals", bse_blocks)
             print(f"BSE Block Deals extracted ({date_string})")
             return
         except Exception as e:
@@ -106,7 +176,7 @@ def scrape_bse_block():
 def scrape_nse_bulk():
     for attempt in range(3):
         try:
-            check_system_resources()
+            # check_system_resources()
             today = datetime.today()
             to_date = today.strftime("%d-%m-%Y")
             from_date = (today - timedelta(days=30)).strftime("%d-%m-%Y")
@@ -169,7 +239,7 @@ def scrape_nse_bulk():
                     record['BD_QTY_TRD'],
                     record['BD_TP_WATP']
                 ])
-            append_unique_rows("bulk_deals.csv", nse_bulk)
+            append_unique_rows("bulk_deals", nse_bulk)
             print(f"NSE Bulk Deals extracted")
             return
         except Exception as e:
@@ -180,7 +250,7 @@ def scrape_nse_bulk():
 def scrape_nse_block():
     for attempt in range(3):
         try:
-            check_system_resources()
+            # check_system_resources()
             today = datetime.today()
             to_date = today.strftime("%d-%m-%Y")
             from_date = (today - timedelta(days=30)).strftime("%d-%m-%Y")
@@ -243,7 +313,7 @@ def scrape_nse_block():
                     record['BD_QTY_TRD'],
                     record['BD_TP_WATP']
                 ])
-            append_unique_rows("block_deals.csv", nse_block)
+            append_unique_rows("block_deals", nse_block)
             print(f"NSE Block Deals extracted")
             return
         except Exception as e:
@@ -253,24 +323,10 @@ def scrape_nse_block():
 
 def run_bulk_block_scrapers():
     start_time = time.time()
-    tasks = [
-        scrape_bse_bulk,
-        scrape_bse_block,
-        scrape_nse_bulk,
-        scrape_nse_block
-    ]
-    
+    tasks = [scrape_bse_bulk, scrape_bse_block, scrape_nse_bulk, scrape_nse_block]
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(task) for task in tasks]
+        futures = [executor.submit(fn) for fn in tasks]
         for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except:
-                pass
-    
-    for filename in ["bulk_deals.csv", "block_deals.csv"]:
-        full_path = get_csv_path(filename)
-        if os.path.exists(full_path):
-            remove_duplicates_from_csv_with_header(full_path)
-    
+            try: future.result()
+            except: pass
     print(f"Bulk/Block scraping completed in {time.time()-start_time:.2f} seconds")

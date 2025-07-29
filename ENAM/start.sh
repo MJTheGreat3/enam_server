@@ -1,9 +1,7 @@
 #!/bin/bash
 
-# Flask Application Startup Script
-# This script handles the startup of the Flask application with proper logging and error handling
-
-set -e  # Exit on any error
+# Exit on any error
+set -e
 
 # Colors for output
 RED='\033[0;31m'
@@ -11,96 +9,58 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Function to print colored output
-print_status() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-print_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
+echo -e "${GREEN}Starting Enam App...${NC}"
 
 # Create necessary directories
-print_status "Creating necessary directories..."
-mkdir -p logs data frontend/static frontend/templates
+echo -e "${YELLOW}Creating necessary directories...${NC}"
+mkdir -p data
+mkdir -p logs
 
-# Set permissions
-print_status "Setting up permissions..."
-chmod +x start.sh 2>/dev/null || true
+# Set environment variables if not already set
+export FLASK_CONFIG=${FLASK_CONFIG:-production}
+export PORT=${PORT:-8000}
 
-# Check if Python is available
-if ! command -v python3 &> /dev/null; then
-    print_error "Python3 is not installed or not in PATH"
-    exit 1
+# Check if virtual environment exists
+if [ ! -d "venv" ]; then
+    echo -e "${YELLOW}Creating virtual environment...${NC}"
+    python3 -m venv venv
 fi
 
-# Check if required files exist
-if [ ! -f "requirements.txt" ]; then
-    print_error "requirements.txt not found"
-    exit 1
-fi
+# Activate virtual environment
+echo -e "${YELLOW}Activating virtual environment...${NC}"
+source venv/bin/activate
 
-if [ ! -f "wsgi.py" ]; then
-    print_error "wsgi.py not found"
-    exit 1
-fi
+# Install/upgrade dependencies
+echo -e "${YELLOW}Installing dependencies...${NC}"
+pip install --upgrade pip
+pip install -r requirements.txt
 
-# Install dependencies if they don't exist
-print_status "Checking Python dependencies..."
-pip3 install -r requirements.txt --quiet || {
-    print_error "Failed to install Python dependencies"
-    exit 1
-}
+# Check database connection
+echo -e "${YELLOW}Checking database connection...${NC}"
+python -c "
+import psycopg2
+from config import config
+import os
 
-# Set environment variables
-export FLASK_APP=wsgi.py
-export FLASK_ENV=production
-export PYTHONPATH=$(pwd)
+config_name = os.environ.get('FLASK_CONFIG', 'production')
+db_config = config[config_name].DB_CONFIG
 
-print_status "Environment variables set:"
-print_status "  FLASK_APP=$FLASK_APP"
-print_status "  FLASK_ENV=$FLASK_ENV"
-print_status "  PYTHONPATH=$PYTHONPATH"
+try:
+    conn = psycopg2.connect(**db_config)
+    conn.close()
+    print('Database connection successful')
+except Exception as e:
+    print(f'Database connection failed: {e}')
+    exit(1)
+"
 
-# Function to handle cleanup on exit
-cleanup() {
-    print_warning "Received shutdown signal, cleaning up..."
-    if [ ! -z "$GUNICORN_PID" ]; then
-        kill $GUNICORN_PID 2>/dev/null || true
-    fi
-    exit 0
-}
+# Start the application
+echo -e "${GREEN}Starting application with Gunicorn...${NC}"
 
-# Set up signal handlers
-trap cleanup SIGTERM SIGINT
-
-# Check if gunicorn is available
-if command -v gunicorn &> /dev/null; then
-    print_status "Starting application with Gunicorn..."
-    
-    # Start with gunicorn
-    if [ -f "gunicorn.conf.py" ]; then
-        gunicorn --config gunicorn.conf.py wsgi:app &
-    else
-        gunicorn --bind 0.0.0.0:8000 --workers 4 --timeout 120 wsgi:app &
-    fi
-    
-    GUNICORN_PID=$!
-    print_status "Gunicorn started with PID: $GUNICORN_PID"
-    
-    # Wait for gunicorn to finish
-    wait $GUNICORN_PID
-    
+if [ "$FLASK_CONFIG" = "development" ]; then
+    echo -e "${YELLOW}Running in development mode...${NC}"
+    python app.py
 else
-    print_warning "Gunicorn not found, falling back to Flask development server"
-    print_warning "This is not recommended for production use!"
-    
-    # Fallback to Flask development server
-    python3 wsgi.py
+    echo -e "${YELLOW}Running in production mode with Gunicorn...${NC}"
+    gunicorn --config gunicorn.conf.py wsgi:application
 fi
-
-print_status "Application has stopped."

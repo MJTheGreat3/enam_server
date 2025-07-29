@@ -11517,3 +11517,19 @@ td.stock-column {
 .refresh-container:hover .last-updated-label {
   display: block;
 }
+
+.portfolio-button {
+  color: #b0c0c2;  
+  border: 2px solid;
+  border-color: #b0c0c2;
+  border-radius: 12px;
+  padding: 6px 12px;
+  text-decoration: none;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+.portfolio-button:hover {
+  background-color: white;
+  border-color: #4f738e;
+  color: #4f738e;
+}

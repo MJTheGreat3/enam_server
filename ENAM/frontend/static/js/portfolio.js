@@ -40,11 +40,11 @@ $(document).ready(function () {
           <button class="portfolio-remove" data-symbol="${item.symbol}">
             <img src="/static/assets/img/close.svg" alt="Remove" class="close-icon">
           </button>
-
         </div>
       `);
     });
-    $(".remove-btn").on("click", function () {
+
+    $(".portfolio-remove").on("click", function () {
       removeSymbol($(this).data("symbol"));
     });
   }
@@ -53,8 +53,8 @@ $(document).ready(function () {
     const q = query.toLowerCase();
 
     function rank(item) {
-      const symbol = item.Symbol.toLowerCase();
-      const name = item.Name.toLowerCase();
+      const symbol = item.symbol.toLowerCase();
+      const name = item.name.toLowerCase();
 
       if (symbol.startsWith(q)) return 1;
       if (name.startsWith(q)) return 2;
@@ -66,31 +66,32 @@ $(document).ready(function () {
     return results.sort((a, b) => rank(a) - rank(b));
   }
 
-  $("#companySearch").on("input", function () {
+  $("#companySearch").on("input", async function () {
     const val = $(this).val().toLowerCase();
     const results = $("#searchResults").empty().toggle(val.length >= 2);
     if (val.length < 2) return;
 
-    Papa.parse("../static/assets/csv/symbols.csv", {
-      download: true,
-      header: true,
-      complete: function (res) {
-        let matches = res.data.filter(r =>
-          r.Symbol && (r.Symbol.toLowerCase().includes(val) || r.Name.toLowerCase().includes(val))
-        );
+    try {
+      const res = await fetch("/api/search-symbols");
+      let matches = await res.json();
 
-        matches = sortResults(matches, val);
+      matches = matches.filter(c =>
+        c.symbol.toLowerCase().includes(val) || c.name.toLowerCase().includes(val)
+      );
 
-        matches.forEach((c) => {
-          results.append(`
-            <a href="#" class="list-group-item company-option">
-              <b>${c.Symbol}</b><br>
-              <small>${c.Name}</small>
-            </a>
-          `);
-        });
-      },
-    });
+      matches = sortResults(matches, val);
+
+      matches.forEach((c) => {
+        results.append(`
+          <a href="#" class="list-group-item company-option">
+            <b>${c.symbol}</b><br>
+            <small>${c.name}</small>
+          </a>
+        `);
+      });
+    } catch (err) {
+      console.error("[ERROR] Fetching symbol suggestions:", err);
+    }
   });
 
   $("#searchResults").on("click", ".company-option", function (e) {

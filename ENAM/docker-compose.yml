@@ -5,21 +5,48 @@ services:
     build: .
     ports:
       - "8000:8000"
+    environment:
+      - FLASK_CONFIG=production
+      - DB_HOST=db
+      - DB_NAME=enam
+      - DB_USER=postgres
+      - DB_PASSWORD=mathew
+      - DB_PORT=5432
+    depends_on:
+      - db
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-      - ./frontend:/app/frontend
-    environment:
-      - FLASK_ENV=production
-      - PYTHONPATH=/app
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+    networks:
+      - app-network
+
+  db:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=enam
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=mathew
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./python/sql_scripts:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    networks:
+      - app-network
 
 volumes:
-  data:
-  logs:
+  postgres_data:
+
+networks:
+  app-network:
+    driver: bridge

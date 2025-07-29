@@ -1,14 +1,16 @@
-from flask import Flask
-from apscheduler.schedulers.background import BackgroundScheduler
-import threading
-import datetime
 import os
+from flask import Flask
+from config import config
+from services.scheduler_service import SchedulerService
+from routes.main_routes import main_bp
+from routes.api_routes import api_bp
 
-from config import Config
-from routes import main_bp, api_bp
-from services import run_scheduled_jobs, run_all_data_scripts, run_all_news_scripts
-
-def create_app():
+def create_app(config_name=None):
+    """Flask application factory"""
+    
+    if config_name is None:
+        config_name = os.environ.get('FLASK_CONFIG', 'default')
+    
     app = Flask(
         __name__,
         template_folder='frontend/templates',
@@ -17,25 +19,42 @@ def create_app():
     )
     
     # Load configuration
-    app.config.from_object(Config)
+    app.config.from_object(config[config_name])
+    
+    # Ensure required directories exist
+    os.makedirs(app.config['DATA_DIR'], exist_ok=True)
+    os.makedirs(app.config['LOGS_DIR'], exist_ok=True)
     
     # Register blueprints
     app.register_blueprint(main_bp)
     app.register_blueprint(api_bp, url_prefix='/api')
     
+    # Initialize scheduler service
+    scheduler_service = SchedulerService(app.config)
+    
+    # Store scheduler service in app context for access in routes
+    app.scheduler_service = scheduler_service
+    
+    # Initialize scheduler immediately after app creation
+    try:
+        scheduler_service.start()
+        scheduler_service.run_initial_jobs()
+        app.logger.info("Scheduler initialized successfully")
+    except Exception as e:
+        app.logger.error(f"Failed to initialize scheduler: {str(e)}")
+    
+    @app.teardown_appcontext
+    def close_scheduler(exception):
+        """Clean up scheduler on app teardown"""
+        if hasattr(app, 'scheduler_service'):
+            try:
+                app.scheduler_service.stop()
+            except Exception as e:
+                app.logger.error(f"Error stopping scheduler: {str(e)}")
+    
     return app
 
-def setup_scheduler():
-    """Setup and start the background scheduler"""
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(run_all_data_scripts, 'interval', minutes=180)
-    scheduler.add_job(run_all_news_scripts, 'interval', minutes=10)
-    scheduler.start()
-    print("[INFO] Scheduler started.")
-    return scheduler
-
+# For development server
 if __name__ == '__main__':
     app = create_app()
-    scheduler = setup_scheduler()
-    run_scheduled_jobs()
     app.run(host='0.0.0.0', port=8000, debug=True)

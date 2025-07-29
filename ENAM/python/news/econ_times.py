@@ -1,59 +1,39 @@
-import csv
 import os
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
-import msvcrt
 
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
+import psycopg2
+
+def get_connection():
+    return psycopg2.connect(
+        dbname="enam",
+        user="postgres",
+        password="mathew",
+        host="localhost",
+        port="5432"
+    )
+
 # === Settings ===
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_FILE = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "..", "frontend", "static", "assets", "csv", "news_repository.csv"))
 SOURCE = "Economic Times"
 TIME_LIMIT = datetime.now(timezone.utc) - timedelta(hours=24)
-HEADERS = ["Source", "Headline", "Link", "Category", "Time"]
-
 START_URL = "https://economictimes.indiatimes.com/news/latest-news"
-
 ALLOWED_CATEGORIES = {"markets", "stocks", "ipos", "economy", "finance"}
-
-# === Windows File Locking ===
-_locked_sizes = {}
-
-def lock_file(file):
-    file.seek(0, os.SEEK_END)
-    size = file.tell()
-    if size == 0:
-        size = 4096
-    file.seek(0)
-    msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, size)
-    _locked_sizes[file.fileno()] = size
-
-def unlock_file(file):
-    size = _locked_sizes.get(file.fileno(), 4096)
-    file.seek(0)
-    msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, size)
-    _locked_sizes.pop(file.fileno(), None)
 
 # === Category Parsing ===
 def parse_category_from_link(link):
     try:
         path = urlparse(link).path
         parts = path.strip("/").split("/")
-
-        # Remove trailing article identifier
         if parts and "articleshow" in parts[-1]:
             parts = parts[:-1]
-
         if not parts:
             return ""
-
-        parts = [part.lower() for part in parts]
-
-        # Priority-based category extraction
+        parts = [p.lower() for p in parts]
         if "economy" in parts:
             return "economy"
         if "finance" in parts:
@@ -64,44 +44,12 @@ def parse_category_from_link(link):
             return "stocks"
         if "markets" in parts:
             return "markets"
-
         return parts[0]
     except Exception:
         return ""
 
 def is_allowed_category(category):
     return category in ALLOWED_CATEGORIES
-
-# === CSV Handling ===
-def read_existing_links():
-    links = set()
-    if not os.path.exists(CSV_FILE):
-        return links
-    with open(CSV_FILE, 'r', newline='', encoding='utf-8') as f:
-        lock_file(f)
-        reader = csv.DictReader(f)
-        for row in reader:
-            links.add(row["Link"])
-        unlock_file(f)
-    return links
-
-def append_new_articles(new_records):
-    existing_records = []
-    if os.path.exists(CSV_FILE):
-        with open(CSV_FILE, 'r', newline='', encoding='utf-8') as f:
-            lock_file(f)
-            reader = csv.DictReader(f)
-            existing_records = list(reader)
-            unlock_file(f)
-
-    with open(CSV_FILE, 'w+', newline='', encoding='utf-8') as f:
-        lock_file(f)
-        writer = csv.DictWriter(f, fieldnames=HEADERS)
-        writer.writeheader()
-        writer.writerows(new_records)         # new on top
-        writer.writerows(existing_records)    # old below
-        f.flush()
-        unlock_file(f)
 
 # === HTML Parsing ===
 def extract_articles_from_html(html):
@@ -130,8 +78,7 @@ def parse_article_li(li_tag):
         art_datetime = None
         if timestr:
             try:
-                art_datetime = datetime.fromisoformat(timestr.replace("Z", "+00:00"))
-                art_datetime = art_datetime.astimezone(timezone.utc)
+                art_datetime = datetime.fromisoformat(timestr.replace("Z", "+00:00")).astimezone(timezone.utc)
             except ValueError:
                 art_datetime = None
 
@@ -140,10 +87,47 @@ def parse_article_li(li_tag):
             "Headline": headline,
             "Link": link,
             "Category": category,
-            "Time": timestr
+            "Time": art_datetime.strftime("%Y-%m-%d %H:%M:%S") if art_datetime else None
         }, art_datetime
     except Exception:
         return None, None
+
+# === Existing Links from DB ===
+def fetch_existing_links():
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT link FROM news WHERE source = %s", (SOURCE,))
+                return set(row[0] for row in cur.fetchall())
+    except Exception as e:
+        print(f"[ERROR][DB] Failed to fetch existing links: {e}")
+        return set()
+
+def insert_articles_to_db(articles):
+    if not articles:
+        return
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                for article in articles:
+                    cur.execute(
+                        """
+                        INSERT INTO news (source, headline, link, category, time)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (link) DO NOTHING
+                        """,
+                        (
+                            article["Source"],
+                            article["Headline"],
+                            article["Link"],
+                            article["Category"],
+                            article["Time"]
+                        )
+                    )
+            conn.commit()
+        print(f"[SCRAPER][SAVE] {len(articles)} articles added from Economic Times.")
+    except Exception as e:
+        print(f"[ERROR][DB] Failed to insert articles: {e}")
 
 # === Main Scraping ===
 def main():
@@ -156,16 +140,14 @@ def main():
     driver.get(START_URL)
     time.sleep(3)
 
-    existing_links = read_existing_links()
-
+    existing_links = fetch_existing_links()
     all_new_records = []
-    stop_scraping = False
     seen_links = set()
+    stop_scraping = False
 
     SCROLL_AMOUNT = 300
     SCROLL_WAIT = 1.0
     MAX_SCROLLS = 100
-
     scroll_count = 0
     last_height = driver.execute_script("return document.body.scrollHeight")
 
@@ -201,13 +183,16 @@ def main():
         new_height = driver.execute_script("return document.body.scrollHeight")
         if new_height == last_height:
             break
+
         last_height = new_height
         scroll_count += 1
 
     driver.quit()
 
     if all_new_records:
-        append_new_articles(all_new_records)
+        insert_articles_to_db(all_new_records)
+    else:
+        print("[SCRAPER][SAVE] 0 articles added from Economic Times.")
 
 if __name__ == "__main__":
     main()

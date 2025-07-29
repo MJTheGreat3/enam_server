@@ -1,141 +1,172 @@
-import os
-import subprocess
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import datetime
 from config import Config
-from services.file_service import set_last_updated
-from python.scrapers import company_data
-import threading
 
-def run_cleaner():
-    """Run the cleaner script"""
-    logs = []
-    cleaner_script = os.path.join('cleaner.py')
+class DataService:
+    """Service for handling database operations and data retrieval"""
     
-    if os.path.exists(os.path.join('python', 'cleaner.py')):
-        logs.append("[INFO] Running cleaner.py...")
+    def __init__(self):
+        self.db_config = Config.DB_CONFIG
+    
+    def get_db_connection(self):
+        """Get database connection"""
+        return psycopg2.connect(**self.db_config)
+    
+    def set_last_updated(self, key):
+        """Set last updated timestamp for a given key"""
+        conn = self.get_db_connection()
         try:
-            result = subprocess.run(
-                ['python', 'cleaner.py'],
-                cwd='python',
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=True
-            )
-            logs.append("[SUCCESS] cleaner.py completed.")
-            if result.stdout:
-                logs.append(result.stdout)
-            if result.stderr:
-                logs.append(f"[STDERR] {result.stderr}")
-        except subprocess.CalledProcessError as e:
-            logs.append(f"[ERROR] cleaner.py failed with code {e.returncode}")
-            logs.append(e.stdout or "")
-            logs.append(f"[STDERR] {e.stderr or ''}")
-    else:
-        logs.append("[WARNING] cleaner.py not found.")
+            with conn, conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO last_updated (key, timestamp)
+                    VALUES (%s, %s)
+                    ON CONFLICT (key) DO UPDATE SET timestamp = EXCLUDED.timestamp;
+                """, (key, datetime.datetime.now()))
+        finally:
+            conn.close()
     
-    return logs
-
-def run_python_script(script_path):
-    """Run a Python script and return logs"""
-    logs = []
-    script_name = os.path.basename(script_path)
-    
-    if not os.path.exists(script_path):
-        logs.append(f"[ERROR] Script not found: {script_path}")
-        return logs
-
-    # Get appropriate lock
-    lock = Config.NEWS_SCRIPT_LOCKS.get(script_name, Config.SCRIPT_LOCK)
-    
-    with lock:
-        logs.append(f"[INFO] Running: {script_path}")
+    def get_last_updated(self, key):
+        """Get last updated timestamp for a given key"""
+        conn = self.get_db_connection()
         try:
-            script_dir = os.path.dirname(script_path)
-            result = subprocess.run(
-                ['python', script_name],
-                cwd=script_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=True
-            )
-            logs.append(f"[SUCCESS] {script_path} completed.")
-            if result.stdout:
-                logs.append(result.stdout)
-            if result.stderr:
-                logs.append(f"[STDERR] {result.stderr}")
-        except subprocess.CalledProcessError as e:
-            logs.append(f"[ERROR] {script_path} failed with code {e.returncode}.")
-            logs.append(e.stdout or "")
-            logs.append(f"[STDERR] {e.stderr or ''}")
+            with conn.cursor() as cur:
+                cur.execute("SELECT timestamp FROM last_updated WHERE key = %s;", (key,))
+                result = cur.fetchone()
+            return result[0].strftime("%Y-%m-%d %H:%M:%S") if result else None
+        finally:
+            conn.close()
     
-    return logs
-
-def run_all_data_scripts():
-    """Run all data collection scripts"""
-    logs = []
-    
-    # Run bulk/block scrapers
-    logs.append("[INFO] Running bulk/block scrapers...")
-    try:
-        result = subprocess.run(
-            ['python', 'scraper.py', 'all'],
-            cwd='python',
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        logs.append("[SUCCESS] Bulk/Block scraping completed.")
-        logs.append(result.stdout)
-        if result.stderr:
-            logs.append(f"[STDERR] {result.stderr}")
-    except Exception as e:
-        logs.append(f"[ERROR] Bulk/Block scraping failed: {str(e)}")
-
-    # Run individual data scripts
-    for script in filter(os.path.exists, Config.DATA_SCRIPTS):
-        logs.extend(run_python_script(script))
-
-    set_last_updated(Config.LAST_UPDATED_DATA_FILE)
-    return logs
-
-def run_all_news_scripts():
-    """Run all news collection scripts"""
-    logs = []
-    news_folder = os.path.join('python', 'news')
-    
-    scripts = [
-        os.path.join(news_folder, s) for s in Config.NEWS_SCRIPTS_WHITELIST
-        if os.path.exists(os.path.join(news_folder, s))
-    ]
-
-    if not scripts:
-        logs.append("[WARNING] No news scripts found to run.")
-        return logs
-
-    logs.append(f"[INFO] Found {len(scripts)} news scripts to run.")
-
-    for script in scripts:
-        logs.append(f"[INFO] Running news script: {script}")
-        logs.extend(run_python_script(script))
-
-        logs.append("[INFO] Running cleaner after news script.")
-        logs.extend(run_cleaner())
-
-    set_last_updated(Config.LAST_UPDATED_NEWS_FILE)
-    logs.append("[INFO] All news scripts (and cleaning) complete.")
-    return logs
-
-def run_company_scrapers_async():
-    """Run company scrapers in background thread"""
-    def target():
+    def get_corp_actions(self):
+        """Get corporate actions for active portfolio symbols"""
+        conn = self.get_db_connection()
         try:
-            logs = []
-            logs.append("[INFO] Running company data scrapers...")
-            company_data.run_company_scrapers()
-            logs.append("[SUCCESS] Company data scraping completed")
-            print("\n".join(logs))
-        except Exception as e:
-            print(f"[ERROR] Company scraping failed: {str(e)}")
-
-    threading.Thread(target=target, daemon=True).start()
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT ca.*
+                    FROM corp_actions ca
+                    JOIN symbols s ON TRIM(ca.security_name) = TRIM(s.symbol)
+                    WHERE s.status = TRUE;
+                """)
+                return cur.fetchall()
+        finally:
+            conn.close()
+    
+    def get_announcements(self):
+        """Get announcements for active portfolio symbols"""
+        conn = self.get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT a.*
+                    FROM announcements a
+                    JOIN symbols s ON TRIM(a.stock) = TRIM(s.symbol)
+                    WHERE s.status = TRUE;
+                """)
+                return cur.fetchall()
+        finally:
+            conn.close()
+    
+    def get_insider_trading(self):
+        """Get insider trading data for active portfolio symbols"""
+        conn = self.get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT i.*
+                    FROM insider_trading i
+                    JOIN symbols s ON TRIM(i.stock) = TRIM(s.symbol)
+                    WHERE s.status = TRUE;
+                """)
+                return cur.fetchall()
+        finally:
+            conn.close()
+    
+    def get_block_deals(self):
+        """Get block deals data for active portfolio symbols"""
+        conn = self.get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT 
+                        b.source,
+                        b.deal_date,
+                        b.security_name,
+                        b.client_name,
+                        b.deal_type,
+                        b.quantity,
+                        b.trade_price
+                    FROM block_deals b
+                    JOIN symbols s ON TRIM(b.security_name) = TRIM(s.symbol)
+                    WHERE s.status = TRUE;
+                """)
+                return cur.fetchall()
+        finally:
+            conn.close()
+    
+    def get_bulk_deals(self):
+        """Get bulk deals data for active portfolio symbols"""
+        conn = self.get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT 
+                        b.source,
+                        b.deal_date,
+                        b.security_name,
+                        b.client_name,
+                        b.deal_type,
+                        b.quantity,
+                        b.price
+                    FROM bulk_deals b
+                    JOIN symbols s ON TRIM(b.security_name) = TRIM(s.symbol)
+                    WHERE s.status = TRUE;
+                """)
+                return cur.fetchall()
+        finally:
+            conn.close()
+    
+    def get_volume_deviation(self):
+        """Get volume deviation data for active portfolio symbols"""
+        conn = self.get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT v.*
+                    FROM vol_deviation v
+                    JOIN symbols s ON TRIM(v.symbol) = TRIM(s.symbol)
+                    WHERE s.status = TRUE;
+                """)
+                return cur.fetchall()
+        finally:
+            conn.close()
+    
+    def get_delivery_deviation(self):
+        """Get delivery deviation data for active portfolio symbols"""
+        conn = self.get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT d.*
+                    FROM deliv_deviation d
+                    JOIN symbols s ON TRIM(d.symbol) = TRIM(s.symbol)
+                    WHERE s.status = TRUE;
+                """)
+                return cur.fetchall()
+        finally:
+            conn.close()
+    
+    def get_news(self):
+        """Get latest news data"""
+        conn = self.get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT source, headline, link, category, time 
+                    FROM news
+                    WHERE headline IS NOT NULL AND time IS NOT NULL
+                    ORDER BY time DESC
+                """)
+                return cur.fetchall()
+        finally:
+            conn.close()

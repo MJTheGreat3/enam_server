@@ -1,16 +1,13 @@
 import requests
 from bs4 import BeautifulSoup, Comment
-import pandas as pd
-import os
 import threading
 import time
 from datetime import datetime, timedelta
 
+import psycopg2
+from psycopg2.extras import execute_values
+
 # === CONFIG ===
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-NEWS_FILE = os.path.abspath(
-    os.path.join(SCRIPT_DIR, "..", "..", "..", "frontend", "static", "assets", "csv", "news_repository.csv")
-)
 SOURCE = "Money Control"
 DATE_CUTOFF = datetime.now() - timedelta(hours=24)
 
@@ -25,13 +22,33 @@ CATEGORIES = {
 
 csv_lock = threading.Lock()
 
-# === LOAD EXISTING LINKS ===
-if os.path.exists(NEWS_FILE):
-    df_all = pd.read_csv(NEWS_FILE)
-    existing_links = set(df_all['Link'].tolist())
-else:
-    df_all = pd.DataFrame(columns=['Source','Headline','Link','Category','Time'])
-    existing_links = set()
+# === DB CONNECTION ===
+def get_connection():
+    return psycopg2.connect(
+        dbname="enam",
+        user="postgres",
+        password="mathew",
+        host="localhost",
+        port="5432"
+    )
+
+def get_existing_links():
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT link FROM news WHERE source = %s", (SOURCE,))
+            return set(row[0] for row in cur.fetchall())
+
+def insert_new_articles(records):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            values = [(SOURCE, r["Headline"], r["Link"], r["Category"], r["Time"]) for r in records]
+            query = """
+                INSERT INTO news (source, headline, link, category, time)
+                VALUES %s
+                ON CONFLICT (link) DO NOTHING;
+            """
+            execute_values(cur, query, values)
+        conn.commit()
 
 # === TIME PARSER ===
 def parse_time(text):
@@ -42,7 +59,7 @@ def parse_time(text):
         return None
 
 # === SCRAPE ONE PAGE ===
-def scrape_page(url, category):
+def scrape_page(url, category, existing_links):
     try:
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         if resp.status_code != 200:
@@ -97,9 +114,7 @@ def scrape_page(url, category):
                     stop_signal = True
                     break
 
-            # Valid new row
             rows.append({
-                "Source": SOURCE,
                 "Headline": headline,
                 "Link": link,
                 "Category": category,
@@ -111,27 +126,18 @@ def scrape_page(url, category):
 
     return rows, stop_signal
 
-# === THREAD WORKER ===
-def scrape_category(category, base_url):
+# === CATEGORY SCRAPER ===
+def scrape_category(category, base_url, existing_links, results_lock, all_new_records):
     page_num = 1
 
     while True:
         page_url = base_url if page_num == 1 else f"{base_url}/page-{page_num}"
-        rows, stop = scrape_page(page_url, category)
+        rows, stop = scrape_page(page_url, category, existing_links)
 
         if rows:
-            with csv_lock:
-                if os.path.exists(NEWS_FILE):
-                    df_current = pd.read_csv(NEWS_FILE)
-                else:
-                    df_current = pd.DataFrame(columns=['Source','Headline','Link','Category','Time'])
-
-                df_new = pd.DataFrame(rows)
-                combined = pd.concat([df_new, df_current], ignore_index=True)
-                combined = combined.drop_duplicates(subset=['Link'])
-
-                combined.to_csv(NEWS_FILE, index=False)
-                existing_links.update(df_new['Link'].tolist())
+            with results_lock:
+                all_new_records.extend(rows)
+                existing_links.update([r["Link"] for r in rows])
 
         if stop or not rows:
             break
@@ -139,12 +145,26 @@ def scrape_category(category, base_url):
         page_num += 1
         time.sleep(1)
 
-# === START THREADS ===
-threads = []
-for cat, url in CATEGORIES.items():
-    t = threading.Thread(target=scrape_category, args=(cat, url))
-    threads.append(t)
-    t.start()
+# === MAIN ===
+def main():
+    existing_links = get_existing_links()
+    results_lock = threading.Lock()
+    all_new_records = []
 
-for t in threads:
-    t.join()
+    threads = []
+    for cat, url in CATEGORIES.items():
+        t = threading.Thread(target=scrape_category, args=(cat, url, existing_links, results_lock, all_new_records))
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+
+    if all_new_records:
+        insert_new_articles(all_new_records)
+        print(f"[{SOURCE}] Inserted {len(all_new_records)} new articles.")
+    else:
+        print(f"[{SOURCE}] No new articles found.")
+
+if __name__ == "__main__":
+    main()

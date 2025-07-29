@@ -40,14 +40,20 @@
             <li class="nav-item"><a class="nav-link" href="/news">News</a></li>
             <li class="nav-item"><a class="nav-link" href="/block-deals">Block Deals</a></li>
             <li class="nav-item"><a class="nav-link" href="/bulk-deals">Bulk Deals</a></li>
-            <li class="nav-item"><a class="nav-link" href="/portfolio">Portfolio</a></li>
             <li class="nav-item"><a class="nav-link" href="/insider-deals">Insider Deals</a></li>
             <li class="nav-item"><a class="nav-link" href="/corp-announcements">Announcements</a></li>
-            <li class="nav-item"><a class="nav-link" href="/corp-actions">Actions</a></li>
+            <li class="nav-item"><a class="nav-link" href="/corp-actions">Corp Actions</a></li>
             <li class="nav-item"><a class="nav-link" href="/mutual-funds">Mutual Funds</a></li>
             <li class="nav-item"><a class="nav-link" href="/volume-reports">Volume Reports</a></li>
-            <li class="nav-item"><a class="nav-link" href="/ath-matrix">ATH Screener</a></li>
+            <li class="nav-item"><a class="nav-link" href="ath-matrix">ATH</a></li>
           </ul>
+
+          <div class="d-flex align-items-center me-3">
+            <button id="toggleDataRefresh" class="btn btn-outline-primary btn-sm">Disable Data Refresh</button>
+            <button id="toggleNewsRefresh" class="btn btn-outline-secondary btn-sm">Disable News Refresh</button>
+            <a class="nav-link portfolio-button" href="/portfolio">Portfolio</a>
+          </div>
+
           <div class="refresh-container ms-3">
             <img id="refreshBtn" src="{{ url_for('static', filename='assets/img/refresh.svg') }}" alt="Refresh" />
             <div class="last-updated-label">

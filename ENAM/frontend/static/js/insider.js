@@ -2,9 +2,19 @@ $(document).ready(function () {
   loadTable({
     id: "#insiderTable",
     controlsId: "#insiderControls",
-    csv: "../static/assets/csv/insider_trading.csv",
-    dateField: "Broadcast Date/Time",
-    format: "dd-mmm-yyyy",
+    apiEndpoint: "/api/insider",
+    dateField: "time",
+    columnMap: {
+      stock: "Stock",
+      name: "Name",
+      clause: "Cluase",
+      amount: "Amount",
+      type: "Type",
+      value: "Value",
+      transaction: "Transaction",
+      attachment: "Attachment",
+      time: "Time"
+    },
     nowrapColumns: ["Stock", "Amount", "Value", "Attachment", "Time"]
   });
 });

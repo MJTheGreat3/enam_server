@@ -1,87 +1,163 @@
-import csv
-import os
-from config import Config
-from python import scraper
+import threading
+from psycopg2.extras import RealDictCursor
+from services.data_service import DataService
 
-def get_portfolio_data():
-    """Get all portfolio items from CSV file"""
-    if not os.path.exists(Config.PORTFOLIO_FILE):
-        return []
+class PortfolioService(DataService):
+    """Service for managing portfolio operations"""
     
-    portfolio = []
-    with open(Config.PORTFOLIO_FILE, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            portfolio.append({
-                "symbol": row["symbol"],
-                "name": row["name"],
-                "status": row.get("status", "Old")
-            })
-    return portfolio
-
-def add_portfolio_item(symbol, name):
-    """Add or update a portfolio item"""
-    rows = []
-    found = False
-
-    if os.path.exists(Config.PORTFOLIO_FILE):
-        with open(Config.PORTFOLIO_FILE, "r", newline="") as f:
-            reader = csv.reader(f)
-            header = next(reader, None)
-            if header is None:
-                header = ["symbol", "name", "status"]
-            
-            for row in reader:
-                if len(row) >= 1 and row[0].upper() == symbol.upper():
-                    # Update existing item
-                    row = [row[0], name if len(row) < 2 else row[1], "New"]
-                    found = True
-                rows.append(row)
-    else:
-        header = ["symbol", "name", "status"]
-
-    if not found:
-        rows.append([symbol.upper(), name, "New"])
-
-    # Ensure directory exists
-    dir_path = os.path.dirname(Config.PORTFOLIO_FILE)
-    if dir_path:
-        os.makedirs(dir_path, exist_ok=True)
+    def __init__(self):
+        super().__init__()
+        self.temp_list = set()  # Symbols pending scraping
     
-    # Write updated data
-    with open(Config.PORTFOLIO_FILE, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        writer.writerows(rows)
-
-def remove_portfolio_item(symbol):
-    """Remove a portfolio item"""
-    if not os.path.exists(Config.PORTFOLIO_FILE):
-        return False
+    def get_active_symbols(self):
+        """Get all active portfolio symbols"""
+        conn = self.get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT Symbol AS symbol, Name AS name
+                    FROM symbols
+                    WHERE Status = TRUE;
+                """)
+                return cur.fetchall()
+        finally:
+            conn.close()
     
-    rows = []
-    found = False
+    def get_available_symbols(self):
+        """Get all available symbols not in portfolio"""
+        conn = self.get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT Symbol AS symbol, Name AS name
+                    FROM symbols
+                    WHERE Status = FALSE;
+                """)
+                return cur.fetchall()
+        finally:
+            conn.close()
     
-    with open(Config.PORTFOLIO_FILE, "r", newline="") as f:
-        reader = csv.reader(f)
-        header = next(reader, None)
-        if header is None:
-            return False
-            
-        for row in reader:
-            if len(row) >= 1 and row[0].upper() == symbol.upper():
-                found = True
-                continue  # Skip this row (delete it)
-            rows.append(row)
-
-    if found:
-        with open(Config.PORTFOLIO_FILE, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(header)
-            writer.writerows(rows)
+    def add_symbol(self, symbol):
+        """Add symbol to portfolio"""
+        symbol_upper = symbol.upper()
+        
+        conn = self.get_db_connection()
+        try:
+            with conn, conn.cursor() as cur:
+                # Find the first record with this symbol
+                cur.execute("""
+                    SELECT Tag_ID FROM symbols 
+                    WHERE Symbol = %s 
+                    LIMIT 1;
+                """, (symbol_upper,))
+                result = cur.fetchone()
+                
+                if not result:
+                    raise ValueError(f"No record found for symbol '{symbol_upper}'")
+                    
+                tag_id = result[0]
+                
+                # Update the status of the found record
+                cur.execute("""
+                    UPDATE symbols 
+                    SET Status = TRUE 
+                    WHERE Tag_ID = %s;
+                """, (tag_id,))
+                
+                self.temp_list.add(symbol_upper)
+                return {"message": f"Symbol '{symbol_upper}' activated in portfolio"}
+                
+        finally:
+            conn.close()
     
-    return found
-
-def apply_portfolio_changes():
-    """Apply portfolio changes by running the scraper"""
-    scraper.main("new")
+    def remove_symbol(self, symbol):
+        """Remove symbol from portfolio"""
+        symbol_upper = symbol.upper()
+        
+        conn = self.get_db_connection()
+        try:
+            with conn, conn.cursor() as cur:
+                # Find the first record with this symbol
+                cur.execute("""
+                    SELECT Tag_ID FROM symbols 
+                    WHERE Symbol = %s 
+                    LIMIT 1;
+                """, (symbol_upper,))
+                result = cur.fetchone()
+                
+                if not result:
+                    raise ValueError(f"No record found for symbol '{symbol_upper}'")
+                    
+                tag_id = result[0]
+                
+                # Update the status of the found record
+                cur.execute("""
+                    UPDATE symbols 
+                    SET Status = FALSE 
+                    WHERE Tag_ID = %s;
+                """, (tag_id,))
+                
+                self.temp_list.discard(symbol_upper)
+                return {"message": f"Symbol '{symbol_upper}' deactivated from portfolio"}
+                
+        finally:
+            conn.close()
+    
+    def apply_changes(self):
+        """Apply portfolio changes by scraping company data"""
+        if not self.temp_list:
+            return {"message": "No pending symbols to scrape."}
+        
+        symbols_to_scrape = list(self.temp_list)
+        
+        def scrape_task():
+            """Background task to scrape company data"""
+            try:
+                # Import here to avoid circular imports
+                from python.scrapers.company_data import scrape_company_data
+                
+                for symbol in symbols_to_scrape:
+                    try:
+                        scrape_company_data(symbol)
+                        self.temp_list.discard(symbol)
+                    except Exception as e:
+                        print(f"Failed to scrape {symbol}: {str(e)}")
+                        
+                print("Company data scraping completed")
+            except Exception as e:
+                print(f"Scraping task failed: {str(e)}")
+        
+        # Start background thread
+        threading.Thread(target=scrape_task, daemon=True).start()
+        
+        return {
+            "message": "Company data scraping initiated",
+            "symbols": symbols_to_scrape
+        }
+    
+    def get_scraper_status(self):
+        """Get current scraper status"""
+        conn = self.get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                # Check company scraper status
+                cur.execute("""
+                    SELECT 
+                        COUNT(*) as total_symbols,
+                        COUNT(CASE WHEN last_scraped IS NOT NULL THEN 1 END) as scraped_symbols,
+                        MAX(last_scraped) as last_scraped_time
+                    FROM symbols 
+                    WHERE status = TRUE
+                """)
+                stats = cur.fetchone()
+                
+                return {
+                    "company_scraper": {
+                        "total_symbols": stats[0],
+                        "scraped_symbols": stats[1],
+                        "last_scraped_time": stats[2].isoformat() if stats[2] else None,
+                        "pending_symbols": list(self.temp_list)
+                    }
+                }
+        finally:
+            conn.close()

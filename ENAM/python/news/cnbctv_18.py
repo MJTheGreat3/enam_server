@@ -1,47 +1,59 @@
+import time
+from datetime import datetime, timezone
+from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from bs4 import BeautifulSoup
-import time
-import pandas as pd
-from datetime import datetime
-import os
-from filelock import FileLock
+import psycopg2
 
+# ----------------------------------------------------------------------------
+# Constants
+SOURCE = "CNBC TV 18"
 URL = "https://www.cnbctv18.com/latest-news/"
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_FILE = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "..", "frontend", "static", "assets", "csv", "news_repository.csv"))
-LOCK_FILE = CSV_FILE + ".lock"
-SOURCE_NAME = "CNBC TV 18"
-
-COLUMNS = ["Source", "Headline", "Link", "Category", "Time"]
 ALLOWED_CATEGORIES = {"market", "stock", "business", "economy"}
 
-options = Options()
-options.add_argument("--headless")
-options.add_argument("--disable-gpu")
-options.add_argument("--no-sandbox")
-driver = webdriver.Chrome(options=options)
+DB_HOST = "localhost"
+DB_PORT = 5432
+DB_NAME = "enam"
+DB_USER = "postgres"
+DB_PASSWORD = "mathew"
 
-def load_existing_links():
-    with FileLock(LOCK_FILE):
-        if os.path.exists(CSV_FILE):
-            df = pd.read_csv(CSV_FILE)
-            if not all(col in df.columns for col in COLUMNS):
-                df = pd.DataFrame(columns=COLUMNS)
-                df.to_csv(CSV_FILE, index=False)
-            return set(df["Link"].dropna().tolist())
-        else:
-            return set()
-
-existing_links = load_existing_links()
-
-def is_today(date_str):
+# ----------------------------------------------------------------------------
+def safe_print(*args, **kwargs):
+    text = " ".join(str(arg) for arg in args)
     try:
-        article_date = datetime.strptime(date_str.strip(), "%b %d, %Y %I:%M %p")
-        return article_date.date() == datetime.now().date()
-    except Exception:
-        return False
+        print(text, **kwargs)
+    except UnicodeEncodeError:
+        print(text.encode('ascii', errors='replace').decode('ascii'), **kwargs)
 
+# ----------------------------------------------------------------------------
+def get_existing_links_from_db(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT link FROM news WHERE source = %s", (SOURCE,))
+        return set(row[0] for row in cur.fetchall())
+
+# ----------------------------------------------------------------------------
+def insert_articles_to_db(conn, articles):
+    with conn.cursor() as cur:
+        for article in articles:
+            cur.execute(
+                """
+                INSERT INTO news (source, headline, link, category, time)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (link) DO NOTHING
+                """,
+                (article['Source'], article['Headline'], article['Link'], article['Category'], article['Time'])
+            )
+    conn.commit()
+
+# ----------------------------------------------------------------------------
+def parse_cnbc_time(date_str):
+    try:
+        dt = datetime.strptime(date_str.strip(), "%b %d, %Y %I:%M %p")
+        return dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+# ----------------------------------------------------------------------------
 def extract_articles(soup, existing_links):
     articles = soup.find_all("article", class_="story-item")
     extracted = []
@@ -60,28 +72,61 @@ def extract_articles(soup, existing_links):
             link = link_tag["href"] if link_tag and link_tag.has_attr("href") else ""
 
             time_tag = article.find("time")
-            published_time = time_tag.text.strip() if time_tag else ""
+            published_str = time_tag.text.strip() if time_tag else ""
+            published_dt = parse_cnbc_time(published_str)
 
-            if not is_today(published_time):
+            if not published_dt:
+                continue
+
+            if published_dt.date() != datetime.now().date():
                 stop_flag = True
                 break
+
             if link in existing_links:
                 stop_flag = True
                 break
 
             extracted.append({
-                "Source": SOURCE_NAME,
+                "Source": SOURCE,
                 "Headline": title,
                 "Link": link,
                 "Category": category,
-                "Time": published_time
+                "Time": published_dt.strftime("%Y-%m-%d %H:%M:%S")
             })
-        except Exception:
+
+            safe_print("[SCRAPER][NEW]", category, "|", title)
+
+        except Exception as e:
             continue
 
     return extracted, stop_flag
 
+# ----------------------------------------------------------------------------
 def scroll_and_scrape():
+    safe_print("[SCRAPER] Starting CNBC TV18 Scraper")
+
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD
+        )
+    except Exception as e:
+        safe_print("[ERROR] DB connection failed:", e)
+        return
+
+    existing_links = get_existing_links_from_db(conn)
+    safe_print(f"[SCRAPER] Loaded {len(existing_links)} existing links for {SOURCE}")
+
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--log-level=3")
+    driver = webdriver.Chrome(options=options)
+
     driver.get(URL)
     time.sleep(3)
 
@@ -94,8 +139,10 @@ def scroll_and_scrape():
         soup = BeautifulSoup(driver.page_source, "html.parser")
         new_articles, stop = extract_articles(soup, existing_links)
         all_articles.extend(new_articles)
+
         if stop:
             break
+
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(2)
         new_height = driver.execute_script("return document.body.scrollHeight")
@@ -106,21 +153,14 @@ def scroll_and_scrape():
     driver.quit()
 
     if all_articles:
-        new_df = pd.DataFrame(all_articles, columns=COLUMNS)
-        with FileLock(LOCK_FILE):
-            if os.path.exists(CSV_FILE):
-                current_df = pd.read_csv(CSV_FILE)
-                if not all(col in current_df.columns for col in COLUMNS):
-                    current_df = pd.DataFrame(columns=COLUMNS)
-                combined_df = pd.concat([new_df, current_df], ignore_index=True)
-            else:
-                combined_df = new_df
-
-            combined_df.to_csv(CSV_FILE, index=False)
-
-        print(f"{len(all_articles)} articles added from CNBCTV18.")
+        insert_articles_to_db(conn, all_articles)
+        safe_print(f"[SCRAPER][SAVE] {len(all_articles)} articles added from CNBC TV18.")
     else:
-        print("0 articles added from CNBCTV18.")
+        safe_print("[SCRAPER] 0 articles added from CNBC TV18.")
 
+    conn.close()
+    safe_print("[SCRAPER] Done.")
+
+# ----------------------------------------------------------------------------
 if __name__ == "__main__":
     scroll_and_scrape()
