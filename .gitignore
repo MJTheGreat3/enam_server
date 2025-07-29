@@ -20,4 +20,5 @@ venv/
 .vscode/
 
 # Logs
-*.log
+*.logENAM/python/token.json
+ENAM/python/client_secret.json
